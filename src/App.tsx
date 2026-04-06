@@ -193,7 +193,6 @@ function App() {
   const [activeDownloaded, setActiveDownloaded] = useState<DownloadVideoResult | null>(null);
   const [isPlayerModalOpen, setIsPlayerModalOpen] = useState<boolean>(false);
   const [isTrimMode, setIsTrimMode] = useState<boolean>(false);
-  const [isTrimPreviewPlaying, setIsTrimPreviewPlaying] = useState<boolean>(false);
   const [trimDurationSeconds, setTrimDurationSeconds] = useState<number>(0);
   const [trimStartSeconds, setTrimStartSeconds] = useState<number>(0);
   const [trimEndSeconds, setTrimEndSeconds] = useState<number>(0);
@@ -348,7 +347,6 @@ function App() {
 
   useEffect(() => {
     setIsTrimMode(false);
-    setIsTrimPreviewPlaying(false);
     setTrimDurationSeconds(0);
     setTrimStartSeconds(0);
     setTrimEndSeconds(0);
@@ -365,7 +363,6 @@ function App() {
       video.currentTime = 0;
     }
     setIsTrimMode(false);
-    setIsTrimPreviewPlaying(false);
     setTrimSeekSeconds(0);
   }, [isPlayerModalOpen]);
 
@@ -381,11 +378,7 @@ function App() {
     video.currentTime = start;
     const playPromise = video.play();
     if (playPromise && typeof playPromise.then === "function") {
-      void playPromise
-        .then(() => setIsTrimPreviewPlaying(true))
-        .catch(() => setIsTrimPreviewPlaying(false));
-    } else {
-      setIsTrimPreviewPlaying(!video.paused);
+      void playPromise.catch(() => undefined);
     }
   }, [
     isTrimMode,
@@ -734,7 +727,6 @@ function App() {
       video.currentTime = 0;
     }
     setIsTrimMode(false);
-    setIsTrimPreviewPlaying(false);
     setTrimStartSeconds(0);
     setTrimSeekSeconds(0);
     setTrimEndSeconds(trimDurationSeconds > 0 ? trimDurationSeconds : 0);
@@ -743,50 +735,6 @@ function App() {
   const closePlayerModal = () => {
     resetTrimEditor();
     setIsPlayerModalOpen(false);
-  };
-
-  const playTrimPreviewFrom = (targetSeconds: number) => {
-    const video = playerVideoRef.current;
-    if (!video) {
-      return;
-    }
-
-    const clamped = clampNumber(
-      targetSeconds,
-      trimStartSeconds,
-      Math.max(trimStartSeconds, trimEndSeconds),
-    );
-    video.currentTime = clamped;
-    const playPromise = video.play();
-    if (playPromise && typeof playPromise.then === "function") {
-      void playPromise
-        .then(() => setIsTrimPreviewPlaying(true))
-        .catch(() => setIsTrimPreviewPlaying(false));
-    } else {
-      setIsTrimPreviewPlaying(!video.paused);
-    }
-  };
-
-  const pauseTrimPreview = () => {
-    const video = playerVideoRef.current;
-    if (!video) {
-      return;
-    }
-    video.pause();
-    setIsTrimPreviewPlaying(false);
-  };
-
-  const toggleTrimPreviewPlayback = () => {
-    const video = playerVideoRef.current;
-    if (!video) {
-      return;
-    }
-
-    if (video.paused) {
-      playTrimPreviewFrom(Math.max(trimStartSeconds, Math.min(trimSeekSeconds, trimEndSeconds)));
-      return;
-    }
-    pauseTrimPreview();
   };
 
   const clearWorkspaceSelections = async () => {
@@ -960,7 +908,6 @@ function App() {
       setTrimEndSeconds(trimDurationSeconds);
       setTrimSeekSeconds(0);
     }
-    setIsTrimPreviewPlaying(false);
     setIsTrimMode(true);
     setError("");
     setSavedNotice("");
@@ -1032,18 +979,10 @@ function App() {
       if (!event.currentTarget.paused) {
         const playPromise = event.currentTarget.play();
         if (playPromise && typeof playPromise.then === "function") {
-          void playPromise.catch(() => setIsTrimPreviewPlaying(false));
+          void playPromise.catch(() => undefined);
         }
       }
     }
-  };
-
-  const onPlayerPlay = () => {
-    setIsTrimPreviewPlaying(true);
-  };
-
-  const onPlayerPause = () => {
-    setIsTrimPreviewPlaying(false);
   };
 
   const applyTrimSelection = async () => {
@@ -1099,7 +1038,6 @@ function App() {
       });
       setActiveDownloaded(trimmedItem);
       setIsTrimMode(false);
-      setIsTrimPreviewPlaying(false);
       setSavedNotice("Trim complete.");
     } catch (trimError) {
       setError(stringifyError(trimError));
@@ -1141,7 +1079,6 @@ function App() {
         outputPath: originalPath,
       });
       setIsTrimMode(false);
-      setIsTrimPreviewPlaying(false);
       setSavedNotice("Returned to original video.");
     } catch (revertError) {
       setError(stringifyError(revertError));
@@ -1275,19 +1212,6 @@ function App() {
           <span>Seek {formatSecondsClock(trimSeekSeconds)}</span>
           <span>End {formatSecondsClock(trimEndSeconds)}</span>
           <strong>Length {formatSecondsClock(trimSelectionDuration)}</strong>
-        </div>
-
-        <div className="line-row trim-preview-controls">
-          <button type="button" onClick={toggleTrimPreviewPlayback}>
-            {isTrimPreviewPlaying ? "Pause Preview" : "Play Preview"}
-          </button>
-          <button
-            type="button"
-            onClick={() => playTrimPreviewFrom(trimStartSeconds)}
-            disabled={trimDurationSeconds <= 0}
-          >
-            Replay Selection
-          </button>
         </div>
 
         <div className="trim-range-stack">
@@ -1882,8 +1806,6 @@ function App() {
         videoRef={playerVideoRef}
         onVideoLoadedMetadata={onPlayerMetadataLoaded}
         onVideoTimeUpdate={onPlayerTimeUpdate}
-        onVideoPlay={onPlayerPlay}
-        onVideoPause={onPlayerPause}
         onClose={closePlayerModal}
         extraBody={trimToolBody}
       />
@@ -1953,8 +1875,6 @@ interface ReusablePlayerModalProps {
   videoRef?: React.RefObject<HTMLVideoElement | null>;
   onVideoLoadedMetadata?: (event: React.SyntheticEvent<HTMLVideoElement>) => void;
   onVideoTimeUpdate?: (event: React.SyntheticEvent<HTMLVideoElement>) => void;
-  onVideoPlay?: () => void;
-  onVideoPause?: () => void;
   onClose: () => void;
   extraBody?: ReactNode;
 }
@@ -1970,8 +1890,6 @@ function ReusablePlayerModal({
   videoRef,
   onVideoLoadedMetadata,
   onVideoTimeUpdate,
-  onVideoPlay,
-  onVideoPause,
   onClose,
   extraBody,
 }: ReusablePlayerModalProps) {
@@ -2020,8 +1938,6 @@ function ReusablePlayerModal({
                 playsInline
                 onLoadedMetadata={onVideoLoadedMetadata}
                 onTimeUpdate={onVideoTimeUpdate}
-                onPlay={onVideoPlay}
-                onPause={onVideoPause}
               />
             ) : mediaType === "gif" ? (
               <img className="preview-media" src={source} alt="download preview" />

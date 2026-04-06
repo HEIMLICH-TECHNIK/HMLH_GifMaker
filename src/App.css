@@ -839,15 +839,6 @@ select {
   color: #f0f0f0;
 }
 
-.trim-preview-controls {
-  justify-content: flex-end;
-  gap: 6px;
-}
-
-.trim-preview-controls button {
-  min-width: 124px;
-}
-
 .trim-range-stack {
   display: grid;
   gap: 6px;
