@@ -469,6 +469,67 @@ select {
   min-height: 0;
 }
 
+.download-link-preview {
+  background: #171717;
+  border-radius: var(--radius-sm);
+  padding: 7px;
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+
+.download-link-preview img,
+.download-link-thumb-fallback {
+  width: 96px;
+  height: 54px;
+  border-radius: 4px;
+  background: #0e0e0e;
+}
+
+.download-link-preview img {
+  object-fit: cover;
+  display: block;
+}
+
+.download-link-thumb-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #8e8e8e;
+  font-size: 0.7rem;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.download-link-meta {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.download-link-meta strong {
+  font-size: 0.82rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.download-progress-wrap {
+  width: 100%;
+  height: 7px;
+  border-radius: 999px;
+  background: #1f1f1f;
+  overflow: hidden;
+}
+
+.download-progress-bar {
+  height: 100%;
+  background: #d9d9d9;
+  width: 0;
+  transition: width 140ms linear;
+}
+
 .download-preview {
   background: #171717;
   border-radius: var(--radius-sm);
@@ -678,6 +739,168 @@ select {
   font-size: 0.76rem;
 }
 
+.player-modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 140;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.46);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+
+.player-modal-panel {
+  width: min(920px, 100%);
+  max-height: min(720px, calc(100vh - 40px));
+  overflow: hidden;
+  background: var(--bg-2);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-panel), 0 0 0 1px rgba(255, 255, 255, 0.06);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.player-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px 10px;
+  border-bottom: 1px solid var(--bg-3);
+}
+
+.player-modal-head h2 {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.player-modal-close {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  font-size: 1rem;
+  line-height: 1;
+  background: var(--bg-3);
+  border-radius: var(--radius-sm);
+  text-transform: uppercase;
+}
+
+.player-modal-close:hover:enabled {
+  background: var(--bg-4);
+}
+
+.player-modal-body {
+  padding: 12px 14px 14px;
+  display: grid;
+  gap: 10px;
+  min-height: 0;
+}
+
+.player-modal-frame {
+  min-height: min(420px, 56vh);
+}
+
+.player-modal-actions {
+  justify-content: flex-end;
+}
+
+.player-modal-actions button {
+  min-width: 92px;
+}
+
+.trim-tool {
+  display: grid;
+  gap: 8px;
+  background: #191919;
+  border-radius: var(--radius-sm);
+  padding: 10px;
+}
+
+.trim-tool-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.72rem;
+  color: #cfcfcf;
+}
+
+.trim-tool-stats strong {
+  font-weight: 600;
+  color: #f0f0f0;
+}
+
+.trim-preview-controls {
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.trim-preview-controls button {
+  min-width: 124px;
+}
+
+.trim-range-stack {
+  display: grid;
+  gap: 6px;
+}
+
+.trim-range-track {
+  position: relative;
+  height: 12px;
+  border-radius: 999px;
+  background: #101010;
+  overflow: hidden;
+}
+
+.trim-range-selected {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.trim-range-seek {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  background: #ffffff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25);
+}
+
+.trim-slider-label {
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+
+.trim-handle {
+  width: 100%;
+  margin: 0;
+  accent-color: #f0f0f0;
+}
+
+.trim-seek-label {
+  display: grid;
+  gap: 5px;
+  font-size: 0.74rem;
+  color: var(--muted);
+}
+
+.trim-seek-label input[type="range"] {
+  width: 100%;
+  margin: 0;
+  accent-color: #d8d8d8;
+}
+
 .settings-modal-overlay {
   position: fixed;
   inset: 0;
@@ -803,6 +1026,23 @@ select {
   .drop-circle {
     width: 172px;
     height: 172px;
+  }
+
+  .player-modal-overlay,
+  .settings-modal-overlay {
+    padding: 10px;
+  }
+
+  .player-modal-panel {
+    max-height: calc(100vh - 20px);
+  }
+
+  .player-modal-frame {
+    min-height: min(280px, 46vh);
+  }
+
+  .trim-tool-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .ring-outer {

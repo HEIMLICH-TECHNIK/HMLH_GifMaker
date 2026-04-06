@@ -1,9 +1,8 @@
-use rusty_ytdl::{choose_format, Video, VideoOptions, VideoQuality, VideoSearchOptions};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -17,7 +16,13 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 const JOB_EVENT: &str = "job-update";
 const QUEUE_EVENT: &str = "queue-update";
+const DOWNLOAD_EVENT: &str = "download-update";
 const CANCELLED_SENTINEL: &str = "__cancelled__";
+const YTDLP_NIGHTLY_WINDOWS_URL: &str =
+    "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.exe";
+const YTDLP_STABLE_WINDOWS_URL: &str =
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
+const YTDLP_REFRESH_INTERVAL_SECONDS: u64 = 60 * 60 * 24;
 static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +107,24 @@ struct DownloadVideoResult {
     url: String,
     title: String,
     output_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadUpdatePayload {
+    url: String,
+    status: String,
+    progress: Option<f64>,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoProbeResult {
+    url: String,
+    title: String,
+    thumbnail_url: Option<String>,
+    duration: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -237,63 +260,150 @@ fn check_ffmpeg_status(app: AppHandle) -> FfmpegStatus {
 }
 
 #[tauri::command]
+async fn probe_video_url(app: AppHandle, url: String) -> Result<VideoProbeResult, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("Enter a URL first.".to_string());
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Err("URL must start with http:// or https://.".to_string());
+    }
+
+    let url_owned = trimmed.to_string();
+    let app_for_worker = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let ytdlp_path = ensure_yt_dlp_binary(&app_for_worker, false)?;
+        run_yt_dlp_probe(&ytdlp_path, &url_owned)
+    })
+    .await
+    .map_err(|err| format!("Failed to run metadata probe task: {err}"))?
+}
+
+#[tauri::command]
 async fn download_video_from_url(app: AppHandle, url: String) -> Result<DownloadVideoResult, String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return Err("Enter a URL first.".to_string());
     }
-
-    let video_options = VideoOptions {
-        quality: VideoQuality::Highest,
-        filter: VideoSearchOptions::VideoAudio,
-        ..Default::default()
-    };
-
-    let video = Video::new_with_options(trimmed.to_string(), video_options.clone())
-        .map_err(|err| format!("Failed to prepare YouTube download: {err}"))?;
-    let info = video
-        .get_basic_info()
-        .await
-        .map_err(|err| format!("Failed to fetch video information: {err}"))?;
-
-    let title = info.video_details.title.trim().to_string();
-    let base_title = if title.is_empty() {
-        "downloaded_video".to_string()
-    } else {
-        sanitize_filename(&title)
-    };
-
-    let extension = choose_format(&info.formats, &video_options)
-        .map(|fmt| sanitize_filename(&fmt.mime_type.container).to_lowercase())
-        .ok()
-        .filter(|ext| !ext.is_empty())
-        .unwrap_or_else(|| "mp4".to_string());
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Err("URL must start with http:// or https://.".to_string());
+    }
 
     let output_dir = staging_output_dir(&app)?;
     fs::create_dir_all(&output_dir)
         .map_err(|err| format!("Failed to create download staging directory: {err}"))?;
 
-    let output_name = format!("{base_title}.{extension}");
-    let output_path = ensure_unique_file_path(&output_dir, &output_name)?;
-
-    video
-        .download(&output_path)
-        .await
-        .map_err(|err| format!("Video download failed: {err}"))?;
-
-    if !output_path.exists() {
-        return Err("Download finished but output file is missing.".to_string());
-    }
-
-    Ok(DownloadVideoResult {
-        url: trimmed.to_string(),
-        title: if title.is_empty() {
-            "Downloaded video".to_string()
-        } else {
-            title
+    let ffmpeg_path = resolve_bundled_binary_path(&app, "ffmpeg").ok();
+    emit_download_update(
+        &app,
+        DownloadUpdatePayload {
+            url: trimmed.to_string(),
+            status: "starting".to_string(),
+            progress: Some(0.0),
+            message: Some("Preparing download...".to_string()),
         },
-        output_path: output_path.to_string_lossy().to_string(),
-    })
+    );
+
+    let url_owned = trimmed.to_string();
+    let first_attempt = {
+        let app_for_worker = app.clone();
+        let output_dir_for_worker = output_dir.clone();
+        let ffmpeg_path_for_worker = ffmpeg_path.clone();
+        let url_for_worker = url_owned.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let ytdlp_path = ensure_yt_dlp_binary(&app_for_worker, false)?;
+            run_yt_dlp_download(
+                &app_for_worker,
+                &ytdlp_path,
+                &url_for_worker,
+                &output_dir_for_worker,
+                ffmpeg_path_for_worker.as_deref(),
+            )
+        })
+        .await
+        .map_err(|err| format!("Failed to run download task: {err}"))?
+    };
+
+    match first_attempt {
+        Ok(result) => {
+            emit_download_update(
+                &app,
+                DownloadUpdatePayload {
+                    url: url_owned.clone(),
+                    status: "completed".to_string(),
+                    progress: Some(100.0),
+                    message: Some("Download complete.".to_string()),
+                },
+            );
+            Ok(result)
+        }
+        Err(first_error) => {
+            let retry_due_to_forbidden = first_error.contains("403")
+                || first_error.contains("Forbidden")
+                || first_error.contains("HTTP Error");
+
+            if !retry_due_to_forbidden {
+                emit_download_update(
+                    &app,
+                    DownloadUpdatePayload {
+                        url: url_owned.clone(),
+                        status: "failed".to_string(),
+                        progress: None,
+                        message: Some(first_error.clone()),
+                    },
+                );
+                return Err(first_error);
+            }
+
+            let retry_attempt = {
+                let app_for_worker = app.clone();
+                let output_dir_for_worker = output_dir.clone();
+                let ffmpeg_path_for_worker = ffmpeg_path.clone();
+                let url_for_worker = url_owned.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    let ytdlp_path = ensure_yt_dlp_binary(&app_for_worker, true)?;
+                    run_yt_dlp_download(
+                        &app_for_worker,
+                        &ytdlp_path,
+                        &url_for_worker,
+                        &output_dir_for_worker,
+                        ffmpeg_path_for_worker.as_deref(),
+                    )
+                })
+                .await
+                .map_err(|err| format!("Failed to run retry download task: {err}"))?
+            };
+
+            retry_attempt
+            .map(|result| {
+                emit_download_update(
+                    &app,
+                    DownloadUpdatePayload {
+                        url: url_owned.clone(),
+                        status: "completed".to_string(),
+                        progress: Some(100.0),
+                        message: Some("Download complete.".to_string()),
+                    },
+                );
+                result
+            })
+            .map_err(|second_error| {
+                let message = format!(
+                    "Video download failed after yt-dlp refresh.\nFirst attempt: {first_error}\nSecond attempt: {second_error}"
+                );
+                emit_download_update(
+                    &app,
+                    DownloadUpdatePayload {
+                        url: url_owned.clone(),
+                        status: "failed".to_string(),
+                        progress: None,
+                        message: Some(message.clone()),
+                    },
+                );
+                message
+            })
+        }
+    }
 }
 
 #[tauri::command]
@@ -522,6 +632,37 @@ fn clear_staging_outputs(app: AppHandle) -> Result<u32, String> {
     }
 
     Ok(removed_count)
+}
+
+#[tauri::command]
+fn remove_staged_file(app: AppHandle, staged_path: String) -> Result<(), String> {
+    let trimmed = staged_path.trim();
+    if trimmed.is_empty() {
+        return Err("Staged file path is required.".to_string());
+    }
+
+    let staging_dir = staging_output_dir(&app)?;
+    fs::create_dir_all(&staging_dir)
+        .map_err(|err| format!("Failed to access staging directory: {err}"))?;
+    let staging_root = fs::canonicalize(&staging_dir)
+        .map_err(|err| format!("Failed to resolve staging directory: {err}"))?;
+
+    let source_path = PathBuf::from(trimmed);
+    if !source_path.exists() {
+        return Ok(());
+    }
+    if source_path.is_dir() {
+        return Err("Directory removal is not allowed for staged file deletion.".to_string());
+    }
+
+    let source_root = fs::canonicalize(&source_path)
+        .map_err(|err| format!("Failed to resolve staged file path: {err}"))?;
+    if !source_root.starts_with(&staging_root) {
+        return Err("Only files in the app staging area can be deleted.".to_string());
+    }
+
+    fs::remove_file(&source_root).map_err(|err| format!("Failed to remove staged file: {err}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -984,6 +1125,509 @@ fn build_ffmpeg_args(job: &EncodeJob) -> Vec<String> {
     args
 }
 
+fn run_yt_dlp_download(
+    app: &AppHandle,
+    ytdlp_path: &Path,
+    url: &str,
+    output_dir: &Path,
+    ffmpeg_path: Option<&str>,
+) -> Result<DownloadVideoResult, String> {
+    let download_started_at = SystemTime::now();
+    let mut command = Command::new(ytdlp_path);
+    command
+        .arg("--ignore-config")
+        .arg("--encoding")
+        .arg("utf-8")
+        .arg("--no-playlist")
+        .arg("--no-warnings")
+        .arg("--no-simulate")
+        .arg("--newline")
+        .arg("--progress-template")
+        .arg("download:%(progress._percent_str)s")
+        .arg("--paths")
+        .arg(output_dir.to_string_lossy().to_string())
+        .arg("--output")
+        .arg("%(title).180B [%(id)s].%(ext)s")
+        .arg("--format")
+        .arg("bv*+ba/b")
+        .arg("--merge-output-format")
+        .arg("mp4")
+        .arg("--force-ipv4");
+
+    if let Some(path) = ffmpeg_path {
+        command.arg("--ffmpeg-location").arg(path);
+    }
+
+    command
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("Failed to run yt-dlp: {err}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture yt-dlp stdout.".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture yt-dlp stderr.".to_string())?;
+
+    let (tx, rx) = mpsc::channel::<ProcessLine>();
+    let tx_stdout = tx.clone();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx_stdout.send(ProcessLine::Stdout(line));
+        }
+    });
+    let tx_stderr = tx.clone();
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = tx_stderr.send(ProcessLine::Stderr(line));
+        }
+    });
+    drop(tx);
+
+    let mut stdout_lines: Vec<String> = Vec::new();
+    let mut stderr_tail: VecDeque<String> = VecDeque::new();
+    let mut observed_output_paths: Vec<String> = Vec::new();
+    let mut last_emitted_progress: f64 = -1.0;
+    let mut last_activity_at = Instant::now();
+
+    loop {
+        while let Ok(line) = rx.try_recv() {
+            last_activity_at = Instant::now();
+            match line {
+                ProcessLine::Stdout(data) => {
+                    if let Some(candidate) = extract_ytdlp_output_path_candidate(&data) {
+                        observed_output_paths.push(candidate);
+                    }
+                    stdout_lines.push(data);
+                }
+                ProcessLine::Stderr(data) => {
+                    if let Some(progress) = extract_ytdlp_progress(&data) {
+                        if (progress - last_emitted_progress).abs() >= 0.5
+                            || (100.0 - progress).abs() <= 0.01
+                        {
+                            emit_download_update(
+                                app,
+                                DownloadUpdatePayload {
+                                    url: url.to_string(),
+                                    status: "progress".to_string(),
+                                    progress: Some(progress),
+                                    message: None,
+                                },
+                            );
+                            last_emitted_progress = progress;
+                        }
+                    }
+
+                    if let Some(candidate) = extract_ytdlp_output_path_candidate(&data) {
+                        observed_output_paths.push(candidate);
+                    }
+
+                    if stderr_tail.len() >= 20 {
+                        stderr_tail.pop_front();
+                    }
+                    stderr_tail.push_back(data);
+                }
+            }
+        }
+
+        if last_activity_at.elapsed() > Duration::from_secs(120) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(
+                "Download timed out after 120 seconds with no progress. Please retry.".to_string(),
+            );
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    if !stderr_tail.is_empty() {
+                        return Err(stderr_tail.into_iter().collect::<Vec<_>>().join("\n"));
+                    }
+                    if !stdout_lines.is_empty() {
+                        return Err(stdout_lines.join("\n"));
+                    }
+                    return Err(format!(
+                        "yt-dlp exited with status code {:?}",
+                        status.code()
+                    ));
+                }
+                break;
+            }
+            Ok(None) => {
+                thread::sleep(Duration::from_millis(120));
+            }
+            Err(err) => return Err(format!("Failed to check yt-dlp process status: {err}")),
+        }
+    }
+
+    let output_path = resolve_download_output_path(
+        output_dir,
+        &observed_output_paths,
+        download_started_at,
+    )
+    .ok_or_else(|| {
+        if observed_output_paths.is_empty() {
+            return "Download finished but no output file path was detected.".to_string();
+        }
+        format!(
+            "Download finished but output file does not exist. Observed paths: {}",
+            observed_output_paths.join(" | ")
+        )
+    })?;
+    if !output_path.exists() {
+        return Err(format!(
+            "Download finished but output file does not exist: {}",
+            output_path.to_string_lossy()
+        ));
+    }
+    let title = derive_title_from_download_path(&output_path);
+
+    Ok(DownloadVideoResult {
+        url: url.to_string(),
+        title,
+        output_path: output_path.to_string_lossy().to_string(),
+    })
+}
+
+fn derive_title_from_download_path(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Downloaded video".to_string());
+
+    if let Some(index) = stem.rfind(" [") {
+        if stem.ends_with(']') {
+            let trimmed = stem[..index].trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    stem.trim().to_string()
+}
+
+fn resolve_download_output_path(
+    output_dir: &Path,
+    observed_paths: &[String],
+    download_started_at: SystemTime,
+) -> Option<PathBuf> {
+    for candidate in observed_paths.iter().rev() {
+        let raw = candidate.trim().trim_matches('"').trim_matches('\'').trim();
+        if raw.is_empty() {
+            continue;
+        }
+
+        let candidate_path = PathBuf::from(raw);
+        let resolved = if candidate_path.is_absolute() {
+            candidate_path
+        } else {
+            output_dir.join(candidate_path)
+        };
+        if resolved.exists() && resolved.is_file() {
+            return Some(resolved);
+        }
+    }
+
+    let mut fallback: Option<(SystemTime, PathBuf)> = None;
+    let entries = fs::read_dir(output_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() || !is_supported_download_file(&path) {
+            continue;
+        }
+
+        let modified = match entry
+            .metadata()
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+        {
+            Some(value) => value,
+            None => continue,
+        };
+        if let Ok(age) = download_started_at.duration_since(modified) {
+            if age > Duration::from_secs(10) {
+                continue;
+            }
+        }
+
+        match &fallback {
+            Some((existing_modified, _)) if modified <= *existing_modified => {}
+            _ => fallback = Some((modified, path)),
+        }
+    }
+
+    fallback.map(|(_, path)| path)
+}
+
+fn is_supported_download_file(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+
+    matches!(
+        extension.as_deref(),
+        Some("mp4")
+            | Some("webm")
+            | Some("mkv")
+            | Some("mov")
+            | Some("m4v")
+            | Some("avi")
+            | Some("flv")
+            | Some("wmv")
+            | Some("gif")
+    )
+}
+
+fn extract_ytdlp_output_path_candidate(line: &str) -> Option<String> {
+    let cleaned = line.trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    if let Some(value) = cleaned.strip_prefix("[download] Destination:") {
+        let candidate = value.trim();
+        if !candidate.is_empty() {
+            return Some(candidate.to_string());
+        }
+    }
+
+    if let Some(value) = cleaned
+        .strip_prefix("[download] ")
+        .and_then(|data| data.strip_suffix(" has already been downloaded"))
+    {
+        let candidate = value.trim();
+        if !candidate.is_empty() {
+            return Some(candidate.to_string());
+        }
+    }
+
+    if let Some(candidate) = extract_quoted_path(cleaned, "Merging formats into ") {
+        return Some(candidate);
+    }
+
+    None
+}
+
+fn extract_quoted_path(input: &str, marker: &str) -> Option<String> {
+    let marker_index = input.find(marker)?;
+    let start = marker_index + marker.len();
+    let remainder = input.get(start..)?.trim_start();
+    let mut chars = remainder.chars();
+    let quote = chars.next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+
+    let content = chars.as_str();
+    let end_index = content.find(quote)?;
+    let value = content[..end_index].trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn run_yt_dlp_probe(ytdlp_path: &Path, url: &str) -> Result<VideoProbeResult, String> {
+    let output = Command::new(ytdlp_path)
+        .arg("--ignore-config")
+        .arg("--encoding")
+        .arg("utf-8")
+        .arg("--no-playlist")
+        .arg("--no-warnings")
+        .arg("--skip-download")
+        .arg("--print")
+        .arg("title")
+        .arg("--print")
+        .arg("thumbnail")
+        .arg("--print")
+        .arg("duration_string")
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("Failed to run yt-dlp probe: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !stderr.is_empty() {
+            return Err(stderr);
+        }
+        return Err("Failed to read video metadata.".to_string());
+    }
+
+    let lines = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    let title = lines
+        .first()
+        .cloned()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Unknown title".to_string());
+    let thumbnail_url = lines
+        .get(1)
+        .cloned()
+        .filter(|value| value.starts_with("http://") || value.starts_with("https://"));
+    let duration = lines
+        .get(2)
+        .cloned()
+        .filter(|value| !value.trim().is_empty());
+
+    Ok(VideoProbeResult {
+        url: url.to_string(),
+        title,
+        thumbnail_url,
+        duration,
+    })
+}
+
+fn extract_ytdlp_progress(line: &str) -> Option<f64> {
+    for token in line.split_whitespace() {
+        let normalized = token.trim().trim_start_matches("download:");
+        let number = normalized.strip_suffix('%')?.trim().trim_start_matches('~');
+        if let Ok(value) = number.parse::<f64>() {
+            if (0.0..=100.0).contains(&value) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn emit_download_update(app: &AppHandle, payload: DownloadUpdatePayload) {
+    let _ = app.emit(DOWNLOAD_EVENT, payload);
+}
+
+fn ensure_yt_dlp_binary(app: &AppHandle, force_refresh: bool) -> Result<PathBuf, String> {
+    let binary_path = ytdlp_binary_path(app)?;
+    let needs_refresh =
+        force_refresh || !binary_path.exists() || should_refresh_download_tool(&binary_path);
+
+    if needs_refresh {
+        refresh_yt_dlp_binary(&binary_path)?;
+    }
+
+    Ok(binary_path)
+}
+
+fn should_refresh_download_tool(binary_path: &Path) -> bool {
+    let metadata = match fs::metadata(binary_path) {
+        Ok(value) => value,
+        Err(_) => return true,
+    };
+    let modified = match metadata.modified() {
+        Ok(value) => value,
+        Err(_) => return true,
+    };
+    let age = match SystemTime::now().duration_since(modified) {
+        Ok(value) => value,
+        Err(_) => return true,
+    };
+    age.as_secs() >= YTDLP_REFRESH_INTERVAL_SECONDS
+}
+
+fn refresh_yt_dlp_binary(binary_path: &Path) -> Result<(), String> {
+    if !cfg!(target_os = "windows") {
+        return Err("Automatic yt-dlp setup is currently supported on Windows only.".to_string());
+    }
+
+    if let Some(parent) = binary_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Failed to create yt-dlp directory: {err}"))?;
+    }
+
+    let temporary_path = binary_path.with_extension("download");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .user_agent("HMLH-Converter/0.1")
+        .build()
+        .map_err(|err| format!("Failed to initialize HTTP client: {err}"))?;
+
+    let mut errors = Vec::new();
+    for source_url in [YTDLP_NIGHTLY_WINDOWS_URL, YTDLP_STABLE_WINDOWS_URL] {
+        match download_file_to_path(&client, source_url, &temporary_path) {
+            Ok(()) => {
+                if binary_path.exists() {
+                    let _ = fs::remove_file(binary_path);
+                }
+
+                fs::copy(&temporary_path, binary_path)
+                    .map_err(|err| format!("Failed to install yt-dlp binary: {err}"))?;
+                let _ = fs::remove_file(&temporary_path);
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(binary_path, fs::Permissions::from_mode(0o755))
+                        .map_err(|err| format!("Failed to set yt-dlp executable permission: {err}"))?;
+                }
+
+                return Ok(());
+            }
+            Err(err) => {
+                errors.push(format!("{source_url} ({err})"));
+                let _ = fs::remove_file(&temporary_path);
+            }
+        }
+    }
+
+    Err(format!(
+        "Failed to download yt-dlp binary. Tried sources: {}",
+        errors.join(" | ")
+    ))
+}
+
+fn download_file_to_path(
+    client: &reqwest::blocking::Client,
+    source_url: &str,
+    destination_path: &Path,
+) -> Result<(), String> {
+    let mut response = client
+        .get(source_url)
+        .send()
+        .map_err(|err| format!("Request failed: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+
+    let mut file = fs::File::create(destination_path)
+        .map_err(|err| format!("Failed to create temporary file: {err}"))?;
+    response
+        .copy_to(&mut file)
+        .map_err(|err| format!("Failed to write yt-dlp binary: {err}"))?;
+    file.flush()
+        .map_err(|err| format!("Failed to finalize yt-dlp binary: {err}"))?;
+    Ok(())
+}
+
+fn ytdlp_binary_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("Failed to resolve app data directory: {err}"))?;
+
+    let executable = if cfg!(target_os = "windows") {
+        "yt-dlp.exe"
+    } else {
+        "yt-dlp"
+    };
+
+    Ok(app_data.join("tools").join("yt-dlp").join(executable))
+}
+
 fn resolve_bundled_binary_path(app: &AppHandle, binary: &str) -> Result<String, String> {
     let executable = if cfg!(target_os = "windows") {
         format!("{binary}.exe")
@@ -1320,11 +1964,13 @@ pub fn run() {
             load_saved_presets,
             save_presets,
             check_ffmpeg_status,
+            probe_video_url,
             download_video_from_url,
             trim_downloaded_video,
             enqueue_encode_job,
             save_outputs,
             clear_staging_outputs,
+            remove_staged_file,
             cancel_encode_job,
             get_queue_snapshot,
             set_queue_limit
