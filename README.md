@@ -1,4 +1,4 @@
-# HMLH GifMaker
+# HMLH Converter
 
 Tauri + Rust + React/TypeScript + FFmpeg 기반의 데스크톱 인코딩 앱입니다.
 

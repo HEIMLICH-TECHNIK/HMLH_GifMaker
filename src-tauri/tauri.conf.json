@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "HMLH GifMaker",
-  "version": "0.1.0",
-  "identifier": "com.hmlh.gifmaker",
+  "productName": "HMLH Converter",
+  "version": "0.0.1",
+  "identifier": "com.hmlh.converter",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "HMLH GifMaker",
+        "title": "HMLH Converter",
         "width": 1320,
         "height": 860,
         "minWidth": 980,
@@ -29,13 +29,18 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
     "resources": [
       "resources/ffmpeg/windows/*",
-      "resources/ffmpeg/macos/*",
-      "resources/ffmpeg/linux/*",
       "resources/licenses/*"
     ],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "startMenuFolder": "HEIMLICH",
+        "installerHooks": "installer/windows/nsis-hooks.nsh"
+      }
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

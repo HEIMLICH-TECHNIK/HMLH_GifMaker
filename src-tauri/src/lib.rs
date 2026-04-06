@@ -1,7 +1,8 @@
+use rusty_ytdl::{choose_format, Video, VideoOptions, VideoQuality, VideoSearchOptions};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, VecDeque},
-    env, fs,
+    fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -95,6 +96,14 @@ struct FfmpegStatus {
     message: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadVideoResult {
+    url: String,
+    title: String,
+    output_path: String,
+}
+
 #[derive(Debug, Clone)]
 struct EncodeJob {
     id: String,
@@ -157,8 +166,31 @@ fn save_presets(app: AppHandle, presets: Vec<EncodingPreset>) -> Result<(), Stri
 
 #[tauri::command]
 fn check_ffmpeg_status(app: AppHandle) -> FfmpegStatus {
-    let ffmpeg_path = resolve_binary_path(&app, "ffmpeg");
-    let ffprobe_path = resolve_binary_path(&app, "ffprobe");
+    let ffmpeg_path = match resolve_bundled_binary_path(&app, "ffmpeg") {
+        Ok(path) => path,
+        Err(message) => {
+            return FfmpegStatus {
+                available: false,
+                ffmpeg_path: "(missing)".to_string(),
+                ffprobe_path: "(missing)".to_string(),
+                version: None,
+                message: Some(message),
+            };
+        }
+    };
+
+    let ffprobe_path = match resolve_bundled_binary_path(&app, "ffprobe") {
+        Ok(path) => path,
+        Err(message) => {
+            return FfmpegStatus {
+                available: false,
+                ffmpeg_path,
+                ffprobe_path: "(missing)".to_string(),
+                version: None,
+                message: Some(message),
+            };
+        }
+    };
 
     match Command::new(&ffmpeg_path)
         .arg("-version")
@@ -187,7 +219,7 @@ fn check_ffmpeg_status(app: AppHandle) -> FfmpegStatus {
                     ffprobe_path,
                     version: None,
                     message: Some(if stderr.is_empty() {
-                        "FFmpeg 실행에 실패했습니다.".to_string()
+                        "Bundled FFmpeg failed to execute.".to_string()
                     } else {
                         stderr
                     }),
@@ -199,9 +231,154 @@ fn check_ffmpeg_status(app: AppHandle) -> FfmpegStatus {
             ffmpeg_path,
             ffprobe_path,
             version: None,
-            message: Some(format!("FFmpeg를 찾지 못했습니다: {err}")),
+            message: Some(format!("Bundled FFmpeg is not executable: {err}")),
         },
     }
+}
+
+#[tauri::command]
+async fn download_video_from_url(app: AppHandle, url: String) -> Result<DownloadVideoResult, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("Enter a URL first.".to_string());
+    }
+
+    let video_options = VideoOptions {
+        quality: VideoQuality::Highest,
+        filter: VideoSearchOptions::VideoAudio,
+        ..Default::default()
+    };
+
+    let video = Video::new_with_options(trimmed.to_string(), video_options.clone())
+        .map_err(|err| format!("Failed to prepare YouTube download: {err}"))?;
+    let info = video
+        .get_basic_info()
+        .await
+        .map_err(|err| format!("Failed to fetch video information: {err}"))?;
+
+    let title = info.video_details.title.trim().to_string();
+    let base_title = if title.is_empty() {
+        "downloaded_video".to_string()
+    } else {
+        sanitize_filename(&title)
+    };
+
+    let extension = choose_format(&info.formats, &video_options)
+        .map(|fmt| sanitize_filename(&fmt.mime_type.container).to_lowercase())
+        .ok()
+        .filter(|ext| !ext.is_empty())
+        .unwrap_or_else(|| "mp4".to_string());
+
+    let output_dir = staging_output_dir(&app)?;
+    fs::create_dir_all(&output_dir)
+        .map_err(|err| format!("Failed to create download staging directory: {err}"))?;
+
+    let output_name = format!("{base_title}.{extension}");
+    let output_path = ensure_unique_file_path(&output_dir, &output_name)?;
+
+    video
+        .download(&output_path)
+        .await
+        .map_err(|err| format!("Video download failed: {err}"))?;
+
+    if !output_path.exists() {
+        return Err("Download finished but output file is missing.".to_string());
+    }
+
+    Ok(DownloadVideoResult {
+        url: trimmed.to_string(),
+        title: if title.is_empty() {
+            "Downloaded video".to_string()
+        } else {
+            title
+        },
+        output_path: output_path.to_string_lossy().to_string(),
+    })
+}
+
+#[tauri::command]
+fn trim_downloaded_video(
+    app: AppHandle,
+    input_path: String,
+    start_seconds: f64,
+    end_seconds: f64,
+) -> Result<String, String> {
+    let trimmed_input = input_path.trim();
+    if trimmed_input.is_empty() {
+        return Err("Input file path is required.".to_string());
+    }
+    if !start_seconds.is_finite() || !end_seconds.is_finite() {
+        return Err("Start/end time must be valid numbers.".to_string());
+    }
+    if start_seconds < 0.0 {
+        return Err("Start time must be 0 or greater.".to_string());
+    }
+    if end_seconds <= start_seconds {
+        return Err("End time must be greater than start time.".to_string());
+    }
+
+    let source_path = PathBuf::from(trimmed_input);
+    if !source_path.exists() || !source_path.is_file() {
+        return Err("Input file does not exist.".to_string());
+    }
+
+    let staging_dir = staging_output_dir(&app)?;
+    fs::create_dir_all(&staging_dir)
+        .map_err(|err| format!("Failed to access staging directory: {err}"))?;
+    let staging_root = fs::canonicalize(&staging_dir)
+        .map_err(|err| format!("Failed to resolve staging directory: {err}"))?;
+    let source_root = fs::canonicalize(&source_path)
+        .map_err(|err| format!("Failed to resolve input file path: {err}"))?;
+    if !source_root.starts_with(&staging_root) {
+        return Err("Only files in the app staging area can be trimmed.".to_string());
+    }
+
+    let source_name = source_path
+        .file_stem()
+        .map(|value| sanitize_filename(&value.to_string_lossy()))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "output".to_string());
+    let output_name = format!("{source_name}_trim.mp4");
+    let output_path = ensure_unique_file_path(&staging_dir, &output_name)?;
+
+    let ffmpeg_path = resolve_bundled_binary_path(&app, "ffmpeg")?;
+    let output = Command::new(ffmpeg_path)
+        .arg("-hide_banner")
+        .arg("-y")
+        .arg("-ss")
+        .arg(format!("{start_seconds:.3}"))
+        .arg("-to")
+        .arg(format!("{end_seconds:.3}"))
+        .arg("-i")
+        .arg(trimmed_input)
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-preset")
+        .arg("medium")
+        .arg("-crf")
+        .arg("22")
+        .arg("-c:a")
+        .arg("aac")
+        .arg("-b:a")
+        .arg("128k")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(output_path.to_string_lossy().to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|err| format!("Failed to run FFmpeg trim command: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "FFmpeg trim command failed.".to_string()
+        } else {
+            stderr
+        });
+    }
+
+    Ok(output_path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -213,7 +390,7 @@ fn enqueue_encode_job(
     validate_request(&request)?;
 
     let job_id = next_job_id();
-    let output_path = build_output_path(&request)?;
+    let output_path = build_staging_output_path(&app, &request)?;
     let job = EncodeJob {
         id: job_id.clone(),
         request,
@@ -246,6 +423,105 @@ fn enqueue_encode_job(
     schedule_jobs(app, state.jobs.clone());
 
     Ok(job_id)
+}
+
+#[tauri::command]
+fn save_outputs(
+    app: AppHandle,
+    destination_dir: String,
+    staged_paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let trimmed_destination = destination_dir.trim();
+    if trimmed_destination.is_empty() {
+        return Err("저장할 폴더를 선택해주세요.".to_string());
+    }
+    if staged_paths.is_empty() {
+        return Err("저장할 결과 파일이 없습니다.".to_string());
+    }
+
+    let destination_path = PathBuf::from(trimmed_destination);
+    fs::create_dir_all(&destination_path)
+        .map_err(|err| format!("저장 폴더 생성 실패: {err}"))?;
+
+    if !destination_path.is_dir() {
+        return Err("선택한 저장 경로가 폴더가 아닙니다.".to_string());
+    }
+
+    let staging_dir = staging_output_dir(&app)?;
+    fs::create_dir_all(&staging_dir).map_err(|err| format!("임시 폴더 생성 실패: {err}"))?;
+    let staging_root = fs::canonicalize(&staging_dir)
+        .map_err(|err| format!("임시 폴더 확인 실패: {err}"))?;
+
+    let mut saved_paths: Vec<String> = Vec::with_capacity(staged_paths.len());
+    for source in staged_paths {
+        let source_trimmed = source.trim();
+        if source_trimmed.is_empty() {
+            continue;
+        }
+
+        let source_path = PathBuf::from(source_trimmed);
+        if !source_path.exists() {
+            return Err(format!("임시 파일을 찾을 수 없습니다: {source_trimmed}"));
+        }
+
+        let source_canonical = fs::canonicalize(&source_path)
+            .map_err(|err| format!("임시 파일 경로 확인 실패: {err}"))?;
+        if !source_canonical.starts_with(&staging_root) {
+            return Err(format!(
+                "앱 임시 저장소 외부 파일은 저장할 수 없습니다: {}",
+                source_path.to_string_lossy()
+            ));
+        }
+
+        let file_name = source_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .ok_or_else(|| "임시 파일 이름을 확인할 수 없습니다.".to_string())?;
+
+        let target_path = ensure_unique_file_path(&destination_path, &file_name)?;
+        fs::copy(&source_path, &target_path).map_err(|err| {
+            format!(
+                "파일 저장 실패 ({}): {err}",
+                source_path.to_string_lossy()
+            )
+        })?;
+
+        saved_paths.push(target_path.to_string_lossy().to_string());
+    }
+
+    if saved_paths.is_empty() {
+        return Err("저장할 결과 파일이 없습니다.".to_string());
+    }
+
+    Ok(saved_paths)
+}
+
+#[tauri::command]
+fn clear_staging_outputs(app: AppHandle) -> Result<u32, String> {
+    let staging_dir = staging_output_dir(&app)?;
+    if !staging_dir.exists() {
+        return Ok(0);
+    }
+
+    let entries = fs::read_dir(&staging_dir)
+        .map_err(|err| format!("Failed to read staging directory: {err}"))?;
+
+    let mut removed_count: u32 = 0;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("Failed to read staging entry: {err}"))?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            fs::remove_dir_all(&path)
+                .map_err(|err| format!("Failed to remove staged directory: {err}"))?;
+        } else if path.exists() {
+            fs::remove_file(&path).map_err(|err| format!("Failed to remove staged file: {err}"))?;
+        }
+
+        removed_count = removed_count.saturating_add(1);
+    }
+
+    Ok(removed_count)
 }
 
 #[tauri::command]
@@ -388,8 +664,44 @@ async fn run_job(app: AppHandle, job: EncodeJob, cancel_flag: Arc<AtomicBool>) {
         },
     );
 
-    let ffmpeg_path = resolve_binary_path(&app, "ffmpeg");
-    let ffprobe_path = resolve_binary_path(&app, "ffprobe");
+    let ffmpeg_path = match resolve_bundled_binary_path(&app, "ffmpeg") {
+        Ok(path) => path,
+        Err(message) => {
+            emit_job_update(
+                &app,
+                JobUpdatePayload {
+                    job_id: job.id.clone(),
+                    status: "failed".to_string(),
+                    progress: None,
+                    eta_seconds: None,
+                    speed: None,
+                    message: Some(message),
+                    input_path: job.request.input_path.clone(),
+                    output_path: job.output_path.clone(),
+                },
+            );
+            return;
+        }
+    };
+    let ffprobe_path = match resolve_bundled_binary_path(&app, "ffprobe") {
+        Ok(path) => path,
+        Err(message) => {
+            emit_job_update(
+                &app,
+                JobUpdatePayload {
+                    job_id: job.id.clone(),
+                    status: "failed".to_string(),
+                    progress: None,
+                    eta_seconds: None,
+                    speed: None,
+                    message: Some(message),
+                    input_path: job.request.input_path.clone(),
+                    output_path: job.output_path.clone(),
+                },
+            );
+            return;
+        }
+    };
     let clip_duration = compute_clip_duration(&ffprobe_path, &job.request);
 
     let app_for_worker = app.clone();
@@ -672,43 +984,75 @@ fn build_ffmpeg_args(job: &EncodeJob) -> Vec<String> {
     args
 }
 
-fn resolve_binary_path(app: &AppHandle, binary: &str) -> String {
-    let env_key = format!("{}_PATH", binary.to_ascii_uppercase());
-    if let Ok(path) = env::var(env_key) {
-        if !path.trim().is_empty() {
-            return path;
-        }
-    }
-
+fn resolve_bundled_binary_path(app: &AppHandle, binary: &str) -> Result<String, String> {
     let executable = if cfg!(target_os = "windows") {
         format!("{binary}.exe")
     } else {
         binary.to_string()
     };
+    let platform = current_platform_segment();
+    let mut candidates: Vec<PathBuf> = Vec::new();
 
     if let Ok(resource_dir) = app.path().resource_dir() {
-        let platform = if cfg!(target_os = "windows") {
-            "windows"
-        } else if cfg!(target_os = "macos") {
-            "macos"
-        } else {
-            "linux"
-        };
+        candidates.push(resource_dir.join("ffmpeg").join(platform).join(&executable));
+        candidates.push(
+            resource_dir
+                .join("resources")
+                .join("ffmpeg")
+                .join(platform)
+                .join(&executable),
+        );
+        candidates.push(resource_dir.join("ffmpeg").join(&executable));
+        candidates.push(resource_dir.join("resources").join("ffmpeg").join(&executable));
+        candidates.push(resource_dir.join(&executable));
+        candidates.push(resource_dir.join("resources").join(&executable));
+    }
 
-        let candidates = [
-            resource_dir.join("ffmpeg").join(platform).join(&executable),
-            resource_dir.join("ffmpeg").join(&executable),
-            resource_dir.join(&executable),
-        ];
+    if cfg!(debug_assertions) {
+        if let Ok(project_dir) = std::env::current_dir() {
+            candidates.push(
+                project_dir
+                    .join("src-tauri")
+                    .join("resources")
+                    .join("ffmpeg")
+                    .join(platform)
+                    .join(&executable),
+            );
+        }
+        candidates.push(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources")
+                .join("ffmpeg")
+                .join(platform)
+                .join(&executable),
+        );
+    }
 
-        for candidate in candidates {
-            if candidate.exists() {
-                return candidate.to_string_lossy().to_string();
-            }
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Ok(candidate.to_string_lossy().to_string());
         }
     }
 
-    executable
+    let searched = candidates
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    Err(format!(
+        "Bundled {binary} is missing. Place file at src-tauri/resources/ffmpeg/{platform}/{executable} before build. Searched: {searched}"
+    ))
+}
+
+fn current_platform_segment() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
 }
 
 fn compute_clip_duration(ffprobe_path: &str, request: &EncodeJobRequest) -> Option<f64> {
@@ -775,6 +1119,14 @@ fn preset_file_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_data_dir()
         .map_err(|err| format!("앱 데이터 디렉토리 확인 실패: {err}"))?;
     Ok(app_data.join("presets.json"))
+}
+
+fn staging_output_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("App data directory lookup failed: {err}"))?;
+    Ok(app_data.join("staging_outputs"))
 }
 
 fn default_presets() -> Vec<EncodingPreset> {
@@ -859,18 +1211,11 @@ fn validate_request(request: &EncodeJobRequest) -> Result<(), String> {
     Ok(())
 }
 
-fn build_output_path(request: &EncodeJobRequest) -> Result<String, String> {
+fn build_staging_output_path(app: &AppHandle, request: &EncodeJobRequest) -> Result<String, String> {
+    let output_dir = staging_output_dir(app)?;
+    fs::create_dir_all(&output_dir).map_err(|err| format!("Failed to create staging directory: {err}"))?;
+
     let input = PathBuf::from(&request.input_path);
-    let output_dir = match &request.output_dir {
-        Some(path) if !path.trim().is_empty() => PathBuf::from(path),
-        _ => input
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from(".")),
-    };
-
-    fs::create_dir_all(&output_dir).map_err(|err| format!("출력 폴더 생성 실패: {err}"))?;
-
     let default_name = input
         .file_stem()
         .map(|name| name.to_string_lossy().to_string())
@@ -881,33 +1226,38 @@ fn build_output_path(request: &EncodeJobRequest) -> Result<String, String> {
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .map(sanitize_filename)
-        .unwrap_or_else(|| {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            format!("{default_name}_{now}")
-        });
+        .unwrap_or_else(|| sanitize_filename(&default_name));
 
-    let mut candidate = output_dir.join(format!("{name_base}.{}", request.format.extension()));
-    if candidate.exists() {
-        for index in 1..=999 {
-            let next = output_dir.join(format!(
-                "{}_{}.{}",
-                name_base,
-                index,
-                request.format.extension()
-            ));
-            if !next.exists() {
-                candidate = next;
-                break;
-            }
-        }
-    }
-
+    let file_name = format!("{name_base}.{}", request.format.extension());
+    let candidate = ensure_unique_file_path(&output_dir, &file_name)?;
     Ok(candidate.to_string_lossy().to_string())
 }
 
+fn ensure_unique_file_path(parent: &Path, file_name: &str) -> Result<PathBuf, String> {
+    let initial = parent.join(file_name);
+    if !initial.exists() {
+        return Ok(initial);
+    }
+
+    let file_path = Path::new(file_name);
+    let stem = file_path
+        .file_stem()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "output".to_string());
+    let extension = file_path
+        .extension()
+        .map(|value| format!(".{}", value.to_string_lossy()))
+        .unwrap_or_default();
+
+    for index in 1..=9_999 {
+        let candidate = parent.join(format!("{stem}_{index}{extension}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err("Failed to generate a unique output file name.".to_string())
+}
 fn sanitize_filename(input: &str) -> String {
     let mut sanitized = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -970,7 +1320,11 @@ pub fn run() {
             load_saved_presets,
             save_presets,
             check_ffmpeg_status,
+            download_video_from_url,
+            trim_downloaded_video,
             enqueue_encode_job,
+            save_outputs,
+            clear_staging_outputs,
             cancel_encode_job,
             get_queue_snapshot,
             set_queue_limit
