@@ -1,0 +1,1 @@
+FFmpeg is licensed under LGPL 2.1+ or GPL 2+ depending on build options.\nWhen bundling binaries, include the exact license text and source-offer obligations that match your chosen binary distribution.

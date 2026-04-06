@@ -1,0 +1,32 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Optional local FFmpeg binaries for bundle testing
+src-tauri/resources/ffmpeg/windows/ffmpeg.exe
+src-tauri/resources/ffmpeg/windows/ffprobe.exe
+src-tauri/resources/ffmpeg/macos/ffmpeg
+src-tauri/resources/ffmpeg/macos/ffprobe
+src-tauri/resources/ffmpeg/linux/ffmpeg
+src-tauri/resources/ffmpeg/linux/ffprobe
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
